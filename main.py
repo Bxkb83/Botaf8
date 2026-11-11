@@ -21,14 +21,14 @@ from aiogram.types import (
     Message, PreCheckoutQuery, ReplyKeyboardRemove, BufferedInputFile
 )
 
-# ▼ FIX: Logging stdout'a → Railway severity:info olarak görür ▼
+# --- LOGLAMA ---
 logging.basicConfig(
     level=logging.INFO,
     stream=sys.stdout,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     force=True,
 )
-# ▲ FIX ▲
+logger = logging.getLogger("MythBot")
 
 # ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -43,7 +43,6 @@ CANCEL_SECONDS = 6 * 60
 
 router = Router()
 fallback_router = Router(name="store-fallback")
-logger = logging.getLogger("service-order-bot")
 ADMIN_IDS = {int(i.strip()) for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip().isdigit()}
 
 def channel_join_url():
@@ -104,7 +103,6 @@ def parse_money(v):
     except: raise ValueError("Geçerli tutar gir.")
 
 def parse_star_tiers(raw):
-    """Sıfır/negatif ve duplicate paketleri filtreler."""
     t = []
     for it in raw.split(","):
         p = it.strip().split(":", 1)
@@ -204,16 +202,16 @@ class DuelFlow(StatesGroup):
     target = State(); amount = State()
 class OrderTrackFlow(StatesGroup):
     order_id = State()
+class PromoUseFlow(StatesGroup):
+    code = State()
 
 # ================= DB =================
 async def open_db():
     db = await aiosqlite.connect(DB_PATH, timeout=10)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA foreign_keys = ON")
-    # ▼ FIX: WAL + busy_timeout → eşzamanlı erişimde kilitlenme önler ▼
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA busy_timeout=5000")
-    # ▲ FIX ▲
     return db
 
 @asynccontextmanager
@@ -223,28 +221,18 @@ async def db_session():
     finally: await db.close()
 
 async def _ensure_columns(db):
-    """Eski DB'ye yeni kolonları ekler (varsa atlar)."""
     migrations = [
-        ("users", "xp", "INTEGER DEFAULT 0"),
-        ("users", "level", "INTEGER DEFAULT 1"),
-        ("users", "daily_streak", "INTEGER DEFAULT 0"),
-        ("users", "last_daily", "TEXT"),
-        ("users", "total_won", "INTEGER DEFAULT 0"),
-        ("users", "total_lost", "INTEGER DEFAULT 0"),
-        ("users", "games_played", "INTEGER DEFAULT 0"),
-        ("users", "games_won", "INTEGER DEFAULT 0"),
-        ("users", "total_spent", "INTEGER DEFAULT 0"),
-        ("users", "duels_won", "INTEGER DEFAULT 0"),
-        ("users", "spins_total", "INTEGER DEFAULT 0"),
-        ("orders", "completed_at", "TEXT"),
-        ("orders", "phone", "TEXT"),
-        ("orders", "code", "TEXT"),
-        ("orders", "service_name", "TEXT"),
-        ("orders", "country_code", "TEXT"),
+        ("users", "xp", "INTEGER DEFAULT 0"), ("users", "level", "INTEGER DEFAULT 1"),
+        ("users", "daily_streak", "INTEGER DEFAULT 0"), ("users", "last_daily", "TEXT"),
+        ("users", "total_won", "INTEGER DEFAULT 0"), ("users", "total_lost", "INTEGER DEFAULT 0"),
+        ("users", "games_played", "INTEGER DEFAULT 0"), ("users", "games_won", "INTEGER DEFAULT 0"),
+        ("users", "total_spent", "INTEGER DEFAULT 0"), ("users", "duels_won", "INTEGER DEFAULT 0"),
+        ("users", "spins_total", "INTEGER DEFAULT 0"), ("orders", "completed_at", "TEXT"),
+        ("orders", "phone", "TEXT"), ("orders", "code", "TEXT"),
+        ("orders", "service_name", "TEXT"), ("orders", "country_code", "TEXT"),
     ]
     for table, col, typedef in migrations:
-        try:
-            await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+        try: await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
         except Exception: pass
     await db.commit()
 
@@ -372,59 +360,140 @@ async def award_xp(bot, db, uid, xp_amount):
         if lv >= 5: await unlock_achievement(bot, uid, "level_5")
         if lv >= 10: await unlock_achievement(bot, uid, "level_10")
 
-# ================= KEYBOARDS =================
+# ================= KEYBOARDS (STYLE PARAMETRELİ) =================
 def main_keyboard(uid):
     rows = [
-        [InlineKeyboardButton(text="🛍️ Market", callback_data="menu:catalog"), InlineKeyboardButton(text="💰 Bakiyem", callback_data="menu:balance")],
-        [InlineKeyboardButton(text="📦 Siparişlerim", callback_data="menu:orders"), InlineKeyboardButton(text="🎯 Günlük", callback_data="menu:daily")],
-        [InlineKeyboardButton(text="🎮 Oyunlar", callback_data="menu:games"), InlineKeyboardButton(text="🏆 Liderlik", callback_data="menu:leaderboard")],
-        [InlineKeyboardButton(text="👤 Profilim", callback_data="menu:profile"), InlineKeyboardButton(text="📊 İstatistikler", callback_data="menu:stats")],
-        [InlineKeyboardButton(text="⭐ Yıldız Yükle", callback_data="menu:topup"), InlineKeyboardButton(text="💎 VIP", callback_data="menu:vip")],
-        [InlineKeyboardButton(text="🎯 Görevler", callback_data="menu:quests"), InlineKeyboardButton(text="🏆 Başarımlar", callback_data="menu:achievements")],
-        [InlineKeyboardButton(text="💼 Banka", callback_data="menu:bank"), InlineKeyboardButton(text="🤝 Transfer", callback_data="menu:transfer")],
-        [InlineKeyboardButton(text="👥 Davet", callback_data="menu:referral"), InlineKeyboardButton(text="🎁 Fırsatlar", callback_data="menu:active")],
-        [InlineKeyboardButton(text="🎫 Kod Takip", callback_data="menu:track"), InlineKeyboardButton(text="📞 Kod Geçmişi", callback_data="menu:code_history")],
-        [InlineKeyboardButton(text="🛒 Sepetim", callback_data="menu:cart"), InlineKeyboardButton(text="⭐ Favoriler", callback_data="menu:favorites")],
-        [InlineKeyboardButton(text="📜 İşlem Geçmişi", callback_data="menu:history"), InlineKeyboardButton(text="💬 Destek", callback_data="menu:support")],
-        [InlineKeyboardButton(text="ℹ️ Yardım", callback_data="menu:help")]
+        [
+            InlineKeyboardButton(text="🛍️ Market", callback_data="menu:catalog", style="primary"),
+            InlineKeyboardButton(text="💰 Bakiyem", callback_data="menu:balance", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="📦 Siparişlerim", callback_data="menu:orders", style="primary"),
+            InlineKeyboardButton(text="🎯 Günlük Ödül", callback_data="menu:daily", style="success")
+        ],
+        [
+            InlineKeyboardButton(text="🎮 Oyunlar", callback_data="menu:games", style="primary"),
+            InlineKeyboardButton(text="🏆 Liderlik", callback_data="menu:leaderboard", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="👤 Profilim", callback_data="menu:profile", style="primary"),
+            InlineKeyboardButton(text="📊 İstatistikler", callback_data="menu:stats", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="⭐ Yıldız Yükle", callback_data="menu:topup", style="success"),
+            InlineKeyboardButton(text="💎 VIP Satın Al", callback_data="menu:vip", style="success")
+        ],
+        [
+            InlineKeyboardButton(text="🎯 Görevler", callback_data="menu:quests", style="primary"),
+            InlineKeyboardButton(text="🏆 Başarımlar", callback_data="menu:achievements", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="💼 Banka", callback_data="menu:bank", style="primary"),
+            InlineKeyboardButton(text="🤝 Transfer", callback_data="menu:transfer", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="👥 Davet Et", callback_data="menu:referral", style="primary"),
+            InlineKeyboardButton(text="🎁 Promo Kod Kullan", callback_data="menu:use_promo", style="success")
+        ],
+        [
+            InlineKeyboardButton(text="💰 Hazine Kap", callback_data="menu:claim_hazine", style="success"),
+            InlineKeyboardButton(text="🎁 Fırsatlar", callback_data="menu:active", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="🎫 Kod Takip", callback_data="menu:track", style="primary"),
+            InlineKeyboardButton(text="📞 Kod Geçmişi", callback_data="menu:code_history", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="🛒 Sepetim", callback_data="menu:cart", style="primary"),
+            InlineKeyboardButton(text="⭐ Favoriler", callback_data="menu:favorites", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="📜 İşlem Geçmişi", callback_data="menu:history", style="primary"),
+            InlineKeyboardButton(text="💬 Destek", callback_data="menu:support", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="ℹ️ Yardım", callback_data="menu:help", style="primary")
+        ]
     ]
-    if is_admin(uid): rows.append([InlineKeyboardButton(text="🛠️ Admin Paneli", callback_data="menu:admin")])
+    if is_admin(uid):
+        rows.append([InlineKeyboardButton(text="🛠️ Admin Paneli", callback_data="menu:admin", style="danger")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def back_to_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu:back")]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu:back", style="danger")]
+    ])
 
 def topup_keyboard():
-    rows = [[InlineKeyboardButton(text=f"{s} ⭐ → {format_money(c)}", callback_data=f"star:{s}")] for s, c in STAR_TOPUP_TIERS]
-    rows.append([InlineKeyboardButton(text="🔙 Geri", callback_data="menu:back")])
+    rows = [
+        [InlineKeyboardButton(text=f"{s} ⭐ → {format_money(c)}", callback_data=f"star:{s}", style="success")]
+        for s, c in STAR_TOPUP_TIERS
+    ]
+    rows.append([InlineKeyboardButton(text="İptal", callback_data="menu:back", style="danger")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def games_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎡 Çark", callback_data="game:wheel"), InlineKeyboardButton(text="🎰 Slot", callback_data="game:slot")],
-        [InlineKeyboardButton(text="🎲 Zar", callback_data="game:dice"), InlineKeyboardButton(text="🪙 Yazı Tura", callback_data="game:coin")],
-        [InlineKeyboardButton(text="🎁 Sandık", callback_data="game:chest"), InlineKeyboardButton(text="⚔️ Düello", callback_data="game:duel")],
-        [InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu:back")]
+        [
+            InlineKeyboardButton(text="🎡 Çark", callback_data="game:wheel", style="success"),
+            InlineKeyboardButton(text="🎰 Slot", callback_data="game:slot", style="success")
+        ],
+        [
+            InlineKeyboardButton(text="🎲 Zar", callback_data="game:dice", style="success"),
+            InlineKeyboardButton(text="🪙 Yazı Tura", callback_data="game:coin", style="success")
+        ],
+        [
+            InlineKeyboardButton(text="🎁 Sandık", callback_data="game:chest", style="success"),
+            InlineKeyboardButton(text="⚔️ Düello", callback_data="game:duel", style="success")
+        ],
+        [
+            InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu:back", style="danger")
+        ]
     ])
 
 def admin_panel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📈 Dashboard", callback_data="admin:dashboard"), InlineKeyboardButton(text="👥 Kullanıcılar", callback_data="admin:total_users")],
-        [InlineKeyboardButton(text="➕ Bakiye Ekle", callback_data="admin:bal_add"), InlineKeyboardButton(text="➖ Bakiye Sil", callback_data="admin:bal_rem")],
-        [InlineKeyboardButton(text="📦 Hizmet Ekle", callback_data="admin:service_add"), InlineKeyboardButton(text="🛒 Ürün Ekle", callback_data="admin:product_add")],
-        [InlineKeyboardButton(text="✨ Özel Hizmet Aç", callback_data="admin:special_add")],
-        [InlineKeyboardButton(text="🎁 Promo Ekle", callback_data="admin:promo_add"), InlineKeyboardButton(text="💰 Hazine Dağıt", callback_data="admin:hazine_add")],
-        [InlineKeyboardButton(text="📋 Promolar", callback_data="admin:promos_list"), InlineKeyboardButton(text="📋 Hazineler", callback_data="admin:hazines_list")],
-        [InlineKeyboardButton(text="📋 Özel Hizmetler", callback_data="admin:specials_list"), InlineKeyboardButton(text="🔄 Kanal Sync", callback_data="admin:sync_channels")],
-        [InlineKeyboardButton(text="⚙️ Ayarlar", callback_data="admin:settings"), InlineKeyboardButton(text="📢 Duyuru", callback_data="admin:broadcast")],
-        [InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu:back")]
+        [
+            InlineKeyboardButton(text="📈 Dashboard", callback_data="admin:dashboard", style="primary"),
+            InlineKeyboardButton(text="👥 Kullanıcılar", callback_data="admin:total_users", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="➕ Bakiye Ekle", callback_data="admin:bal_add", style="success"),
+            InlineKeyboardButton(text="➖ Bakiye Sil", callback_data="admin:bal_rem", style="danger")
+        ],
+        [
+            InlineKeyboardButton(text="📦 Hizmet Ekle", callback_data="admin:service_add", style="primary"),
+            InlineKeyboardButton(text="🛒 Ürün Ekle", callback_data="admin:product_add", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="✨ Özel Hizmet Aç", callback_data="admin:special_add", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="🎁 Promo Ekle", callback_data="admin:promo_add", style="success"),
+            InlineKeyboardButton(text="💰 Hazine Dağıt", callback_data="admin:hazine_add", style="success")
+        ],
+        [
+            InlineKeyboardButton(text="📋 Promolar", callback_data="admin:promos_list", style="primary"),
+            InlineKeyboardButton(text="📋 Hazineler", callback_data="admin:hazines_list", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="📋 Özel Hizmetler", callback_data="admin:specials_list", style="primary"),
+            InlineKeyboardButton(text="🔄 Kanal Sync", callback_data="admin:sync_channels", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="⚙️ Ayarlar", callback_data="admin:settings", style="primary"),
+            InlineKeyboardButton(text="📢 Duyuru", callback_data="admin:broadcast", style="primary")
+        ],
+        [
+            InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu:back", style="danger")
+        ]
     ])
 
 def settings_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="VIP Sistemi (Aç/Kapat)", callback_data="toggle:vip_enabled")],
-        [InlineKeyboardButton(text="Referans: İlk Sipariş Şartı", callback_data="toggle:ref_require_order")],
-        [InlineKeyboardButton(text="🔙 Admin", callback_data="menu:admin")]
+        [InlineKeyboardButton(text="VIP Sistemi (Aç/Kapat)", callback_data="toggle:vip_enabled", style="primary")],
+        [InlineKeyboardButton(text="Referans: İlk Sipariş Şartı", callback_data="toggle:ref_require_order", style="primary")],
+        [InlineKeyboardButton(text="🔙 Admin", callback_data="menu:admin", style="danger")]
     ])
 
 # ================= PROMO/HAZINE KANAL =================
@@ -433,7 +502,7 @@ def build_promo_text(p):
     rem = max(0, tot - used); tl = time_remaining_str(p["expires_at"])
     bar = progress_bar(used, tot)
     dep = used >= tot; exp = is_expired(p["expires_at"])
-    head = "❌ <b>TÜKENDİ</b>" if dep else ("⏱️ <b>SÜRE DOLDU</b>" if exp else "🎁 <b>PROMO — AKTİF</b>")
+    head = "<b>TÜKENDİ</b>" if dep else ("<b>SÜRE DOLDU</b>" if exp else "<b>PROMO — AKTİF</b>")
     text = (f"╭──────────────────────────────╮\n   {head}\n╰──────────────────────────────╯\n\n"
             f"🔑 <b>Kod:</b> <code>{esc(p['code'])}</code>\n💰 <b>Ödül:</b> <code>{format_money(p['bonus_cents'])}</code>\n\n"
             f"📊 <b>Kullanım</b>\n├ Kullanıldı: <b>{used}</b>/{tot}\n├ Kalan: <b>{rem}</b>\n└ {bar}\n\n"
@@ -447,7 +516,7 @@ def build_hazine_text(h):
     ru = max(0, mu - used); tl = time_remaining_str(h["expires_at"])
     bar = progress_bar(used, mu)
     dep = used >= mu or ra <= 0; exp = is_expired(h["expires_at"])
-    head = "❌ <b>TÜKENDİ</b>" if dep else ("⏱️ <b>SÜRE DOLDU</b>" if exp else "💰 <b>HAZİNE — AÇIK</b>")
+    head = "<b>TÜKENDİ</b>" if dep else ("<b>SÜRE DOLDU</b>" if exp else "<b>HAZİNE — AÇIK</b>")
     text = (f"╭──────────────────────────────╮\n   {head}\n╰──────────────────────────────╯\n\n"
             f"💎 <b>Toplam:</b> <code>{format_money(ta)}</code>\n💵 <b>Kalan:</b> <code>{format_money(ra)}</code>\n\n"
             f"👥 <b>Kontenjan</b>\n├ Kullanan: <b>{used}</b>/{mu}\n├ Kalan: <b>{ru}</b>\n└ {bar}\n\n"
@@ -466,7 +535,10 @@ async def refresh_promo(bot, code):
         kb = None
         if not dep and not exp:
             u = await get_bot_username(bot)
-            if u: kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎁 Kullan", url=f"https://t.me/{u}?start=promo_{code}")]])
+            if u:
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Kullan", url=f"https://t.me/{u}?start=promo_{code}", style="success")]
+                ])
         try: await bot.edit_message_text(PROMO_CHANNEL_ID, p["message_id"], text, parse_mode="HTML", reply_markup=kb)
         except TelegramBadRequest: pass
         if (dep or exp) and p["active"]:
@@ -486,7 +558,10 @@ async def refresh_hazine(bot, hid):
         kb = None
         if not dep and not exp:
             u = await get_bot_username(bot)
-            if u: kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Kap", url=f"https://t.me/{u}?start=hazine_{hid}")]])
+            if u:
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Kap", url=f"https://t.me/{u}?start=hazine_{hid}", style="success")]
+                ])
         try: await bot.edit_message_text(PROMO_CHANNEL_ID, h["message_id"], text, parse_mode="HTML", reply_markup=kb)
         except TelegramBadRequest: pass
         if (dep or exp) and h["active"]:
@@ -511,46 +586,27 @@ async def channel_updater(bot):
         except Exception as e: logger.error(f"channel_updater: {e}")
         await asyncio.sleep(60)
 
-# ================= AUTO CLEANUP =================
 async def background_cleanup(bot):
-    """Süresi dolmuş sipariş/hazine/promo/özel hizmetleri kapat + iade."""
     await asyncio.sleep(20)
     while True:
         try:
             expired_orders = []
             async with db_session() as db:
-                cur = await db.execute(
-                    "SELECT order_id, user_id, amount_cents FROM orders WHERE status = 'pending' AND expires_at < ?",
-                    (timestamp(),)
-                )
+                cur = await db.execute("SELECT order_id, user_id, amount_cents FROM orders WHERE status = 'pending' AND expires_at < ?", (timestamp(),))
                 expired_orders = await cur.fetchall()
                 for o in expired_orders:
-                    cur2 = await db.execute(
-                        "UPDATE orders SET status = 'cancelled' WHERE order_id = ? AND status = 'pending'",
-                        (o["order_id"],)
-                    )
+                    cur2 = await db.execute("UPDATE orders SET status = 'cancelled' WHERE order_id = ? AND status = 'pending'", (o["order_id"],))
                     if cur2.rowcount > 0:
-                        await db.execute(
-                            "UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?",
-                            (o["amount_cents"], o["user_id"])
-                        )
+                        await db.execute("UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?", (o["amount_cents"], o["user_id"]))
                         await add_transaction(db, o["user_id"], o["amount_cents"], "auto_refund", f"#{o['order_id']} süre doldu")
-                        try:
-                            await bot.send_message(
-                                o["user_id"],
-                                f"⏱️ **Sipariş #{o['order_id']} süresi doldu**\n\n💰 `{format_money(o['amount_cents'])}` iade edildi.",
-                                parse_mode="Markdown"
-                            )
+                        try: await bot.send_message(o["user_id"], f"⏱️ **Sipariş #{o['order_id']} süresi doldu**\n\n💰 `{format_money(o['amount_cents'])}` iade edildi.", parse_mode="Markdown")
                         except: pass
                         stop_order_animation(o["order_id"])
                 await db.execute("UPDATE hazine SET active = 0 WHERE active = 1 AND expires_at < ?", (timestamp(),))
                 await db.execute("UPDATE promos SET active = 0 WHERE active = 1 AND expires_at < ?", (timestamp(),))
                 await db.execute("UPDATE special_services SET active = 0 WHERE active = 1 AND expires_at < ?", (timestamp(),))
                 await db.commit()
-            if expired_orders:
-                logger.info(f"Auto-refund: {len(expired_orders)} sipariş")
-        except Exception as e:
-            logger.error(f"background_cleanup: {e}")
+        except Exception as e: logger.error(f"background_cleanup: {e}")
         await asyncio.sleep(30)
 
 # ================= MIDDLEWARE =================
@@ -569,8 +625,8 @@ class JoinMiddleware(BaseMiddleware):
         except: ok = None
         if ok is False:
             kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📣 Katıl", url=channel_join_url())],
-                [InlineKeyboardButton(text="✅ Kontrol Et", callback_data="check_join")]
+                [InlineKeyboardButton(text="📣 Katıl", url=channel_join_url(), style="primary")],
+                [InlineKeyboardButton(text="✅ Kontrol Et", callback_data="check_join", style="success")]
             ])
             if isinstance(event, Message): await event.answer("👋 Önce kanala katıl.", reply_markup=kb)
             elif isinstance(event, CallbackQuery): await event.answer("Önce kanala katıl.", show_alert=True)
@@ -599,99 +655,53 @@ async def build_welcome(uid, fname):
             f"🚀 *7/24 otomatik teslimat.*\n\n"
             f"👇 Menüden işlem seç:")
 
-# ▼ FIX: start_handler güvenli sürüm — ReplyKeyboardRemove(), Markdown fallback, sessiz hata yutma yok ▼
 @router.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
-    if not message.from_user:
-        return
+    if not message.from_user: return
     uid = message.from_user.id
-
-    try:
-        await state.clear()
-    except Exception as e:
-        logger.error(f"start state_clear: {e}")
-
-    try:
-        await message.answer("🔄 Hazırlanıyor...", reply_markup=ReplyKeyboardRemove())
-    except Exception as e:
-        logger.error(f"start reply_kb_remove: {e}")
-
+    try: await state.clear()
+    except: pass
+    try: await message.answer("🔄 Hazırlanıyor...", reply_markup=ReplyKeyboardRemove())
+    except: pass
+    
     is_new = False
-    try:
-        async with db_session() as db:
-            cur = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (uid,))
-            is_new = (await cur.fetchone()) is None
-    except Exception as e:
-        logger.error(f"start db_check: {e}")
+    async with db_session() as db:
+        cur = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (uid,))
+        is_new = (await cur.fetchone()) is None
+    if is_new: await ensure_user(message.from_user)
 
-    if is_new:
-        try:
-            await ensure_user(message.from_user)
-        except Exception as e:
-            logger.error(f"start ensure_user: {e}")
-
-    try:
-        args = (message.text or "").split()
-        if len(args) > 1:
-            param = args[1]
-            if param.startswith("ref_"):
-                try:
-                    rid = int(param[4:])
-                    if rid != uid and is_new:
-                        async with db_session() as db:
-                            cur = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (rid,))
-                            if await cur.fetchone():
-                                await db.execute(
-                                    "INSERT OR IGNORE INTO referrals (referrer_id, referred_user_id, reward_cents, created_at) VALUES (?, ?, ?, ?)",
-                                    (rid, uid, REFERRAL_BONUS_CENTS, timestamp()),
-                                )
-                                await db.commit()
-                                await progress_quest(message.bot, rid, "referral", 1)
-                        if (await get_setting("ref_require_order")) == "0":
-                            async with db_session() as db:
-                                cur = await db.execute("SELECT 1 FROM referrals WHERE referred_user_id = ? AND rewarded_at IS NULL", (uid,))
-                                if await cur.fetchone():
-                                    await db.execute("UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?", (REFERRAL_BONUS_CENTS, rid))
-                                    await db.execute("UPDATE referrals SET rewarded_at = ? WHERE referred_user_id = ?", (timestamp(), uid))
-                                    await add_transaction(db, rid, REFERRAL_BONUS_CENTS, "referral", "Davet ödülü")
-                                    await db.commit()
-                except Exception as e:
-                    logger.error(f"start ref_parse: {e}")
-            elif param.startswith("promo_"):
-                await process_promo_claim(message, param[6:].upper())
-            elif param.startswith("hazine_"):
-                try:
-                    await process_hazine_claim(message, int(param[7:]))
-                except Exception as e:
-                    logger.error(f"start hazine_claim: {e}")
-            elif param.startswith("special_"):
-                try:
-                    await process_special_claim(message, int(param[8:]), message.from_user)
-                except Exception as e:
-                    logger.error(f"start special_claim: {e}")
-    except Exception as e:
-        logger.error(f"start_params: {e}")
+    args = (message.text or "").split()
+    if len(args) > 1:
+        param = args[1]
+        if param.startswith("ref_"):
+            try:
+                rid = int(param[4:])
+                if rid != uid and is_new:
+                    async with db_session() as db:
+                        cur = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (rid,))
+                        if await cur.fetchone():
+                            await db.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_user_id, reward_cents, created_at) VALUES (?, ?, ?, ?)", (rid, uid, REFERRAL_BONUS_CENTS, timestamp()))
+                            await db.commit()
+            except: pass
+        elif param.startswith("promo_"): await process_promo_claim(message, param[6:].upper())
+        elif param.startswith("hazine_"):
+            try: await process_hazine_claim(message, int(param[7:]))
+            except: pass
+        elif param.startswith("special_"):
+            try: await process_special_claim(message, int(param[8:]), message.from_user)
+            except: pass
 
     try:
         text = await build_welcome(uid, message.from_user.first_name)
         await message.answer(text, reply_markup=main_keyboard(uid), parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"start_final_markdown: {e}")
-        try:
-            fname = message.from_user.first_name or "User"
-            await message.answer(
-                f"🌟 Hoş geldin, {fname}!\n\nMenüyü kullanmak için aşağıdaki butonlara tıklayabilirsin.",
-                reply_markup=main_keyboard(uid),
-            )
-        except Exception as e2:
-            logger.error(f"start_final_plain: {e2}")
-# ▲ FIX ▲
+        logger.error(f"start_final: {e}")
+        fname = message.from_user.first_name or "User"
+        await message.answer(f"🌟 Hoş geldin, {fname}!\n\nMenüyü kullanmak için aşağıdaki butonlara tıklayabilirsin.", reply_markup=main_keyboard(uid))
 
-# ▼ FIX: /ping test komutu — teşhis için ▼
 @router.message(Command("ping"))
 async def cmd_ping(message: Message):
     await message.answer("🏓 Pong! Bot mesaj alıyor ve cevap veriyor.")
-# ▲ FIX ▲
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
@@ -708,19 +718,10 @@ async def back_to_menu(cb: CallbackQuery, state: FSMContext):
 # ================= CLAIM =================
 async def process_promo_claim(message, code):
     async with db_session() as db:
-        cur = await db.execute(
-            "UPDATE promos SET current_uses = current_uses + 1 WHERE code = ? AND active = 1 AND current_uses < max_uses AND expires_at > ?",
-            (code, timestamp())
-        )
+        cur = await db.execute("UPDATE promos SET current_uses = current_uses + 1 WHERE code = ? AND active = 1 AND current_uses < max_uses AND expires_at > ?", (code, timestamp()))
         if cur.rowcount == 0:
-            cur = await db.execute("SELECT * FROM promos WHERE code = ?", (code,))
-            p = await cur.fetchone()
-            if not p: return await message.answer("❌ Geçersiz kod.")
-            if not p["active"] or p["current_uses"] >= p["max_uses"]: return await message.answer("❌ Limit doldu.")
-            if is_expired(p["expires_at"]): return await message.answer("❌ Süre doldu.")
-            return await message.answer("❌ Kullanılamıyor.")
-        try:
-            await db.execute("INSERT INTO promo_uses (code, user_id) VALUES (?, ?)", (code, message.from_user.id))
+            return await message.answer("❌ Geçersiz kod, süresi dolmuş veya limiti aşılmış.")
+        try: await db.execute("INSERT INTO promo_uses (code, user_id) VALUES (?, ?)", (code, message.from_user.id))
         except:
             await db.execute("UPDATE promos SET current_uses = current_uses - 1 WHERE code = ?", (code,))
             await db.commit()
@@ -729,21 +730,15 @@ async def process_promo_claim(message, code):
         bonus = (await cur.fetchone())["bonus_cents"]
         await db.execute("UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?", (bonus, message.from_user.id))
         await add_transaction(db, message.from_user.id, bonus, "promo", f"Promo: {code}")
-        await award_xp(message.bot, db, message.from_user.id, 5)
         await db.commit()
-    await message.answer(f"🎁 **Promo!**\n\n✅ +`{format_money(bonus)}`", parse_mode="Markdown")
+    await message.answer(f"✅ **Promo Başarılı!**\n\n+`{format_money(bonus)}` bakiyene eklendi.", parse_mode="Markdown")
     await refresh_promo(message.bot, code)
 
 async def process_hazine_claim(message, hid):
     async with db_session() as db:
-        cur = await db.execute(
-            "UPDATE hazine SET current_users = current_users + 1 WHERE id = ? AND active = 1 AND current_users < max_users AND remaining_cents > 0 AND expires_at > ?",
-            (hid, timestamp())
-        )
-        if cur.rowcount == 0:
-            return await message.answer("❌ Hazine tükendi veya süresi doldu.")
-        try:
-            await db.execute("INSERT INTO hazine_claims (hazine_id, user_id, amount_cents) VALUES (?, ?, 0)", (hid, message.from_user.id))
+        cur = await db.execute("UPDATE hazine SET current_users = current_users + 1 WHERE id = ? AND active = 1 AND current_users < max_users AND remaining_cents > 0 AND expires_at > ?", (hid, timestamp()))
+        if cur.rowcount == 0: return await message.answer("❌ Hazine tükendi veya süresi doldu.")
+        try: await db.execute("INSERT INTO hazine_claims (hazine_id, user_id, amount_cents) VALUES (?, ?, 0)", (hid, message.from_user.id))
         except:
             await db.execute("UPDATE hazine SET current_users = current_users - 1 WHERE id = ?", (hid,))
             await db.commit()
@@ -768,7 +763,7 @@ async def process_hazine_claim(message, hid):
         if h2["current_users"] >= h2["max_users"] or h2["remaining_cents"] <= 0:
             await db.execute("UPDATE hazine SET active = 0 WHERE id = ?", (hid,))
         await db.commit()
-    await message.answer(f"💰 **Hazine Payı!**\n\n✅ +`{format_money(amt)}`", parse_mode="Markdown")
+    await message.answer(f"🎉 **HAZİNE KAZANDINIZ!**\n\n✅ +`{format_money(amt)}`", parse_mode="Markdown")
     await refresh_hazine(message.bot, hid)
 
 async def process_special_claim(message, spid, user):
@@ -779,43 +774,23 @@ async def process_special_claim(message, spid, user):
         cur = await db.execute("SELECT balance_cents, vip_until FROM users WHERE user_id = ?", (user.id,))
         u = await cur.fetchone()
         price = int(sp["price_cents"] * 0.8) if is_vip_user(u) else sp["price_cents"]
-        cur = await db.execute(
-            "UPDATE special_services SET current_users = current_users + 1 WHERE id = ? AND active = 1 AND current_users < max_users AND expires_at > ?",
-            (spid, timestamp())
-        )
-        if cur.rowcount == 0:
-            return await message.answer("❌ Kontenjan doldu.")
-        cur = await db.execute(
-            "UPDATE users SET balance_cents = balance_cents - ? WHERE user_id = ? AND balance_cents >= ?",
-            (price, user.id, price)
-        )
+        cur = await db.execute("UPDATE special_services SET current_users = current_users + 1 WHERE id = ? AND active = 1 AND current_users < max_users AND expires_at > ?", (spid, timestamp()))
+        if cur.rowcount == 0: return await message.answer("❌ Kontenjan doldu.")
+        cur = await db.execute("UPDATE users SET balance_cents = balance_cents - ? WHERE user_id = ? AND balance_cents >= ?", (price, user.id, price))
         if cur.rowcount == 0:
             await db.execute("UPDATE special_services SET current_users = current_users - 1 WHERE id = ?", (spid,))
             await db.commit()
             return await message.answer("❌ Yetersiz bakiye.")
-        cur = await db.execute(
-            "INSERT INTO orders (user_id, item_type, item_id, item_name, amount_cents, status, created_at, expires_at, service_name) VALUES (?, 'special', ?, ?, ?, 'pending', ?, ?, ?)",
-            (user.id, spid, sp["name"], price, timestamp(), (now_utc()+timedelta(seconds=CANCEL_SECONDS)).isoformat(), sp["name"])
-        )
+        cur = await db.execute("INSERT INTO orders (user_id, item_type, item_id, item_name, amount_cents, status, created_at, expires_at, service_name) VALUES (?, 'special', ?, ?, ?, 'pending', ?, ?, ?)", (user.id, spid, sp["name"], price, timestamp(), (now_utc()+timedelta(seconds=CANCEL_SECONDS)).isoformat(), sp["name"]))
         oid = cur.lastrowid
         await add_transaction(db, user.id, -price, "order", f"Sipariş #{oid}")
-        cur = await db.execute("SELECT current_users, max_users, msg_id FROM special_services WHERE id = ?", (spid,))
-        sp_after = await cur.fetchone()
-        if sp_after["current_users"] >= sp_after["max_users"]:
-            await db.execute("UPDATE special_services SET active = 0 WHERE id = ?", (spid,))
-            if sp_after["msg_id"] and PROMO_CHANNEL_ID:
-                try: await message.bot.delete_message(PROMO_CHANNEL_ID, sp_after["msg_id"])
-                except: pass
         await db.commit()
     await message.answer(f"🎉 **Satın Alındı!**\n\n✅ {sp['name']}\n⏳ Admin numara iletecek.")
-    try:
-        msg = await message.bot.send_message(user.id, generate_circle("Yükleniyor"), parse_mode="HTML")
-        ORDER_ANIMATIONS[oid] = True
-        ORDER_MESSAGE_REFS[oid] = (user.id, msg.message_id)
-        asyncio.create_task(animate_order_status(message.bot, user.id, msg.message_id, oid))
-    except: pass
     await notify_admins(message.bot, f"🔔 **Sipariş #{oid}**\n👤 {await get_display_name(user.id)}\n📦 {sp['name']}\n💵 {format_money(price)}",
-        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📱 Numara", callback_data=f"n:{oid}")],[InlineKeyboardButton(text="❌ İade", callback_data=f"o:refund:{oid}")]]))
+        kb=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Numara", callback_data=f"n:{oid}", style="primary")],
+            [InlineKeyboardButton(text="❌ İade", callback_data=f"o:refund:{oid}", style="danger")]
+        ]))
 
 @router.callback_query(F.data == "check_join")
 async def check_join(cb: CallbackQuery):
@@ -832,6 +807,27 @@ async def check_join(cb: CallbackQuery):
         await safe_edit(cb, text, reply_markup=main_keyboard(cb.from_user.id), parse_mode="Markdown")
         await cb.answer("✅ Onaylandı!", show_alert=True)
     else: await cb.answer("❌ Katılmadın.", show_alert=True)
+
+# ================= PROMO / HAZINE KULLANICI =================
+@router.callback_query(F.data == "menu:use_promo")
+async def menu_use_promo(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(PromoUseFlow.code)
+    await safe_edit(cb, "🎁 **Promo Kod Kullan**\n\nLütfen elinizdeki promosyon kodunu yazın.\n\n❌ İptal: /cancel", reply_markup=back_to_menu_kb(), parse_mode="Markdown")
+    await cb.answer()
+
+@router.message(PromoUseFlow.code)
+async def promo_code_handler(message: Message, state: FSMContext):
+    await state.clear()
+    await process_promo_claim(message, message.text.strip().upper())
+
+@router.callback_query(F.data == "menu:claim_hazine")
+async def menu_claim_hazine(cb: CallbackQuery):
+    async with db_session() as db:
+        cur = await db.execute("SELECT id FROM hazine WHERE active = 1 AND current_users < max_users AND remaining_cents > 0 LIMIT 1")
+        h = await cur.fetchone()
+    if not h: return await cb.answer("❌ Şu an aktif bir hazine bulunmuyor veya tükendi.", show_alert=True)
+    await process_hazine_claim(cb.message, h["id"])
+    await cb.answer()
 
 # ================= BALANCE / HISTORY / STATS / PROFILE / ORDERS =================
 @router.callback_query(F.data == "menu:balance")
@@ -959,8 +955,8 @@ async def menu_daily(cb: CallbackQuery):
         return await safe_edit(cb, f"🎯 **Günlük**\n\n✅ Bugün aldın!\n🔥 Seri: `{streak} gün`\n\n⏳ 20 saat sonra.", reply_markup=back_to_menu_kb(), parse_mode="Markdown")
     nxt = min(streak, 6); rw = DAILY_REWARDS[nxt]
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🎁 {format_money(rw)} Al", callback_data="daily:claim")],
-        [InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu:back")]
+        [InlineKeyboardButton(text=f"🎁 {format_money(rw)} Al", callback_data="daily:claim", style="success")],
+        [InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu:back", style="danger")]
     ])
     await safe_edit(cb, f"🎯 **Günlük**\n\n🔥 Seri: `{streak} gün`\n🎁 Bugün: `{format_money(rw)}`\n📅 Yarın: `{format_money(DAILY_REWARDS[min(streak+1, 6)])}`\n\n20 saatte bir al!", reply_markup=kb, parse_mode="Markdown")
     await cb.answer()
@@ -1160,7 +1156,8 @@ async def duel_amount(message: Message, state: FSMContext):
         cur = await db.execute("INSERT INTO duels (challenger_id, opponent_id, bet_cents, created_at) VALUES (?, ?, ?, ?)", (message.from_user.id, opp, bet, timestamp()))
         did = cur.lastrowid; await db.commit()
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Kabul", callback_data=f"duel:accept:{did}"), InlineKeyboardButton(text="❌ Reddet", callback_data=f"duel:reject:{did}")]
+        [InlineKeyboardButton(text="✅ Kabul", callback_data=f"duel:accept:{did}", style="success")],
+        [InlineKeyboardButton(text="❌ Reddet", callback_data=f"duel:reject:{did}", style="danger")]
     ])
     try: await message.bot.send_message(opp, f"⚔️ **Düello!**\n\n👤 {message.from_user.first_name} seni çağırdı!\n💰 `{format_money(bet)}`", reply_markup=kb, parse_mode="Markdown")
     except: return await message.answer("❌ Rakip mesaj alamıyor.")
@@ -1228,9 +1225,9 @@ async def menu_bank(cb: CallbackQuery):
         text += f"├ `#{d['id']}` {format_money(amt)} → {format_money(amt+intr)} (%{d['interest_pct']})"
         text += " ✅\n" if ready else f" ⏳ {time_remaining_str(d['matures_at'])}\n"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Yatır", callback_data="bank:deposit")],
-        [InlineKeyboardButton(text="💸 Çek", callback_data="bank:withdraw")],
-        [InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu:back")]
+        [InlineKeyboardButton(text="💰 Yatır", callback_data="bank:deposit", style="success")],
+        [InlineKeyboardButton(text="💸 Çek", callback_data="bank:withdraw", style="success")],
+        [InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu:back", style="danger")]
     ])
     await safe_edit(cb, text, reply_markup=kb, parse_mode="Markdown"); await cb.answer()
 
@@ -1249,7 +1246,10 @@ async def bank_amt(message: Message, state: FSMContext):
         u = await cur.fetchone()
     if u["balance_cents"] < amt: return await message.answer("❌ Yetersiz.")
     await state.update_data(amount=amt); await state.set_state(BankDepositFlow.duration)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"{n} — %{p}", callback_data=f"bank:plan:{i}")] for i, (n, h, p) in enumerate(BANK_PLANS)])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{n} — %{p}", callback_data=f"bank:plan:{i}", style="success")]
+        for i, (n, h, p) in enumerate(BANK_PLANS)
+    ])
     await message.answer(f"💰 `{format_money(amt)}`\n\nPlan:", reply_markup=kb, parse_mode="Markdown")
 
 @router.callback_query(F.data.startswith("bank:plan:"))
@@ -1264,8 +1264,7 @@ async def bank_plan(cb: CallbackQuery, state: FSMContext):
     matures = (now_utc() + timedelta(hours=h)).isoformat()
     async with db_session() as db:
         cur = await db.execute("UPDATE users SET balance_cents = balance_cents - ? WHERE user_id = ? AND balance_cents >= ?", (amt, cb.from_user.id, amt))
-        if cur.rowcount == 0:
-            return await cb.answer("Yetersiz.", show_alert=True)
+        if cur.rowcount == 0: return await cb.answer("Yetersiz.", show_alert=True)
         await db.execute("INSERT INTO bank_deposits (user_id, amount_cents, interest_pct, deposited_at, matures_at) VALUES (?, ?, ?, ?, ?)", (cb.from_user.id, amt, p, timestamp(), matures))
         await add_transaction(db, cb.from_user.id, -amt, "bank_dep", n)
         await award_xp(cb.bot, db, cb.from_user.id, 10)
@@ -1284,9 +1283,9 @@ async def bank_wd(cb: CallbackQuery):
         if is_expired(d["matures_at"]):
             intr = int(d["amount_cents"] * d["interest_pct"] / 100)
             tot = d["amount_cents"] + intr
-            kb.append([InlineKeyboardButton(text=f"💵 {format_money(tot)}", callback_data=f"bank:do:{d['id']}")])
+            kb.append([InlineKeyboardButton(text=f"💵 {format_money(tot)}", callback_data=f"bank:do:{d['id']}", style="success")])
     if not kb: return await cb.answer("Vadesi dolan yok.", show_alert=True)
-    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:bank")])
+    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:bank", style="danger")])
     await safe_edit(cb, "💸 **Çekilebilir:**", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)); await cb.answer()
 
 @router.callback_query(F.data.startswith("bank:do:"))
@@ -1334,8 +1333,9 @@ async def menu_quests(cb: CallbackQuery):
         bar = progress_bar(prog, target, 10)
         st = "✅ Alındı" if claimed else ("🎁 Hazır" if done else f"{prog}/{target}")
         text += f"{lbl}\n├ {bar}\n├ {st}\n└ `{format_money(rw)}`\n\n"
-        if done and not claimed: kb.append([InlineKeyboardButton(text=f"🎁 {lbl[:20]}", callback_data=f"quest:claim:{qid}")])
-    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:back")])
+        if done and not claimed:
+            kb.append([InlineKeyboardButton(text=f"🎁 {lbl[:20]}", callback_data=f"quest:claim:{qid}", style="success")])
+    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:back", style="danger")])
     await safe_edit(cb, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown"); await cb.answer()
 
 @router.callback_query(F.data.startswith("quest:claim:"))
@@ -1415,8 +1415,11 @@ async def menu_fav(cb: CallbackQuery):
     text = "⭐ **Favoriler**\n\n"; kb = []
     for f in favs:
         text += f"• {f['sn']} ({f['country_code']}) — `{format_money(f['price_cents'])}`\n"
-        kb.append([InlineKeyboardButton(text=f"🛒 {f['sn'][:20]}", callback_data=f"buyprod:{f['product_id']}"), InlineKeyboardButton(text="❌", callback_data=f"fav:rm:{f['product_id']}")])
-    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:back")])
+        kb.append([
+            InlineKeyboardButton(text=f"🛒 {f['sn'][:20]}", callback_data=f"buyprod:{f['product_id']}", style="success"),
+            InlineKeyboardButton(text="❌", callback_data=f"fav:rm:{f['product_id']}", style="danger")
+        ])
+    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:back", style="danger")])
     await safe_edit(cb, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown"); await cb.answer()
 
 @router.callback_query(F.data.startswith("fav:add:"))
@@ -1451,19 +1454,19 @@ async def menu_active(cb: CallbackQuery):
         if is_expired(p["expires_at"]) or p["current_uses"] >= p["max_uses"]: continue
         any_ = True
         text += f"🎁 <b>{esc(p['code'])}</b> • 💰 {format_money(p['bonus_cents'])} • ⏳ {time_remaining_str(p['expires_at'])}\n"
-        if u: kb.append([InlineKeyboardButton(text=f"🎁 {p['code']}", url=f"https://t.me/{u}?start=promo_{p['code']}")])
+        if u: kb.append([InlineKeyboardButton(text=f"🎁 {p['code']}", url=f"https://t.me/{u}?start=promo_{p['code']}", style="success")])
     for h in hs:
         if is_expired(h["expires_at"]) or h["current_users"] >= h["max_users"]: continue
         any_ = True
         text += f"💰 Hazine: {format_money(h['remaining_cents'])} • ⏳ {time_remaining_str(h['expires_at'])}\n"
-        if u: kb.append([InlineKeyboardButton(text=f"💰 Hazine Kap", url=f"https://t.me/{u}?start=hazine_{h['id']}")])
+        if u: kb.append([InlineKeyboardButton(text="💰 Hazine Kap", url=f"https://t.me/{u}?start=hazine_{h['id']}", style="success")])
     for s in ss:
         if is_expired(s["expires_at"]) or s["current_users"] >= s["max_users"]: continue
         any_ = True
         text += f"✨ {esc(s['name'])} • {format_money(s['price_cents'])}\n"
-        if u: kb.append([InlineKeyboardButton(text=f"✨ {esc(s['name'][:20])}", url=f"https://t.me/{u}?start=special_{s['id']}")])
+        if u: kb.append([InlineKeyboardButton(text=f"✨ {esc(s['name'][:20])}", url=f"https://t.me/{u}?start=special_{s['id']}", style="success")])
     if not any_: return await safe_edit(cb, "🎯 Aktif fırsat yok.", reply_markup=back_to_menu_kb())
-    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:back")])
+    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:back", style="danger")])
     await safe_edit(cb, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML"); await cb.answer()
 
 @router.callback_query(F.data == "menu:referral")
@@ -1510,16 +1513,17 @@ async def menu_help(cb: CallbackQuery):
 @router.callback_query(F.data == "menu:vip")
 async def menu_vip(cb: CallbackQuery):
     if not await is_feature_enabled("vip_enabled"): return await safe_edit(cb, "🚧 VIP kapalı.", reply_markup=back_to_menu_kb())
-    # DB'den oku
     price_str = await get_setting("vip_price_tl") or VIP_PRICE_TL
     days_str = await get_setting("vip_duration_days") or VIP_DURATION_DAYS
     text = f"💎 **VIP**\n\n✅ %20 indirim\n✅ Öncelikli\n\n💰 `{price_str} TL` • `{days_str} gün`"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💳 Satın Al", callback_data="vip_buy")],[InlineKeyboardButton(text="🔙", callback_data="menu:back")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Satın Al", callback_data="vip_buy", style="success")],
+        [InlineKeyboardButton(text="🔙", callback_data="menu:back", style="danger")]
+    ])
     await safe_edit(cb, text, reply_markup=kb, parse_mode="Markdown"); await cb.answer()
 
 @router.callback_query(F.data == "vip_buy")
 async def vip_buy(cb: CallbackQuery):
-    # DB'den oku
     price_str = await get_setting("vip_price_tl") or VIP_PRICE_TL
     days_str = await get_setting("vip_duration_days") or VIP_DURATION_DAYS
     try:
@@ -1537,8 +1541,7 @@ async def vip_buy(cb: CallbackQuery):
             except: pass
         nv = (base + timedelta(days=days)).isoformat()
         cur = await db.execute("UPDATE users SET balance_cents = balance_cents - ?, vip_until = ? WHERE user_id = ? AND balance_cents >= ?", (price, nv, cb.from_user.id, price))
-        if cur.rowcount == 0:
-            return await cb.answer("❌ Yetersiz bakiye.", show_alert=True)
+        if cur.rowcount == 0: return await cb.answer("❌ Yetersiz bakiye.", show_alert=True)
         await add_transaction(db, cb.from_user.id, -price, "vip", f"{days} gün VIP")
         await db.commit()
     await unlock_achievement(cb.bot, cb.from_user.id, "vip_member")
@@ -1568,14 +1571,10 @@ async def pcq(q: PreCheckoutQuery):
     async with db_session() as db:
         cur = await db.execute("SELECT user_id, stars_amount, credit_cents, status FROM star_payment_intents WHERE payload = ?", (q.invoice_payload,))
         row = await cur.fetchone()
-    if not row:
-        return await q.answer(ok=False, error_message="Geçersiz ödeme.")
-    if row["user_id"] != q.from_user.id:
-        return await q.answer(ok=False, error_message="Yetkisiz.")
-    if row["status"] == "paid":
-        return await q.answer(ok=False, error_message="Zaten tamamlandı.")
-    if q.total_amount != row["stars_amount"]:
-        return await q.answer(ok=False, error_message="Tutar uyuşmuyor.")
+    if not row: return await q.answer(ok=False, error_message="Geçersiz ödeme.")
+    if row["user_id"] != q.from_user.id: return await q.answer(ok=False, error_message="Yetkisiz.")
+    if row["status"] == "paid": return await q.answer(ok=False, error_message="Zaten tamamlandı.")
+    if q.total_amount != row["stars_amount"]: return await q.answer(ok=False, error_message="Tutar uyuşmuyor.")
     await q.answer(ok=True)
 
 @router.message(F.successful_payment)
@@ -1603,8 +1602,11 @@ async def menu_cat(cb: CallbackQuery, state: FSMContext):
         cur = await db.execute("SELECT service_id, name FROM services WHERE active = 1")
         srvs = await cur.fetchall()
     if not srvs: return await safe_edit(cb, "🛒 Hizmet yok.", reply_markup=back_to_menu_kb())
-    kb = [[InlineKeyboardButton(text=s["name"], callback_data=f"srv:{s['service_id']}")] for s in srvs]
-    kb.append([InlineKeyboardButton(text="🛒 Sepetim", callback_data="menu:cart"), InlineKeyboardButton(text="🔙", callback_data="menu:back")])
+    kb = [[InlineKeyboardButton(text=f"📦 {s['name']}", callback_data=f"srv:{s['service_id']}", style="primary")] for s in srvs]
+    kb.append([
+        InlineKeyboardButton(text="🛒 Sepetim", callback_data="menu:cart", style="primary"),
+        InlineKeyboardButton(text="🔙", callback_data="menu:back", style="danger")
+    ])
     await safe_edit(cb, "🛍️ **Market**\n\nHizmet:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown"); await cb.answer()
 
 @router.callback_query(F.data.startswith("srv:"))
@@ -1620,11 +1622,11 @@ async def srv_prods(cb: CallbackQuery):
     for p in prods:
         cc = p["country_code"] if p["country_code"] else "Özel"
         kb.append([
-            InlineKeyboardButton(text=f"{cc} - {format_money(p['price_cents'])}", callback_data=f"buyprod:{p['product_id']}"),
-            InlineKeyboardButton(text="⭐", callback_data=f"fav:add:{p['product_id']}"),
-            InlineKeyboardButton(text="🛒", callback_data=f"cart:add:{p['product_id']}")
+            InlineKeyboardButton(text=f"{cc} - {format_money(p['price_cents'])}", callback_data=f"buyprod:{p['product_id']}", style="success"),
+            InlineKeyboardButton(text="⭐", callback_data=f"fav:add:{p['product_id']}", style="primary"),
+            InlineKeyboardButton(text="🛒", callback_data=f"cart:add:{p['product_id']}", style="primary")
         ])
-    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:catalog")])
+    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:catalog", style="danger")])
     await safe_edit(cb, f"📦 **{srv['name']}**\n\nÜlke:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown"); await cb.answer()
 
 @router.callback_query(F.data.startswith("buyprod:"))
@@ -1634,16 +1636,13 @@ async def buy_prod(cb: CallbackQuery):
     async with db_session() as db:
         cur = await db.execute("SELECT p.price_cents, p.country_code, p.active as pactive, s.name, s.active as sactive FROM products p JOIN services s ON p.service_id = s.service_id WHERE p.product_id = ?", (pid,))
         p = await cur.fetchone()
-        if not p or not p["pactive"] or not p["sactive"]:
-            return await cb.answer("Ürün artık mevcut değil.", show_alert=True)
+        if not p or not p["pactive"] or not p["sactive"]: return await cb.answer("Ürün artık mevcut değil.", show_alert=True)
         cur = await db.execute("SELECT balance_cents, vip_until FROM users WHERE user_id = ?", (cb.from_user.id,)); u = await cur.fetchone()
         fp = int(p["price_cents"] * 0.8) if is_vip_user(u) else p["price_cents"]
         fname = f"{p['name']} ({p['country_code']})"
         cur = await db.execute("UPDATE users SET balance_cents = balance_cents - ?, total_spent = total_spent + ? WHERE user_id = ? AND balance_cents >= ?", (fp, fp, cb.from_user.id, fp))
-        if cur.rowcount == 0:
-            return await cb.answer("❌ Yetersiz bakiye.", show_alert=True)
-        cur = await db.execute("INSERT INTO orders (user_id, item_type, item_id, item_name, amount_cents, status, created_at, expires_at, service_name, country_code) VALUES (?, 'product', ?, ?, ?, 'pending', ?, ?, ?, ?)",
-                             (cb.from_user.id, pid, fname, fp, timestamp(), (now_utc()+timedelta(seconds=CANCEL_SECONDS)).isoformat(), p["name"], p["country_code"]))
+        if cur.rowcount == 0: return await cb.answer("❌ Yetersiz bakiye.", show_alert=True)
+        cur = await db.execute("INSERT INTO orders (user_id, item_type, item_id, item_name, amount_cents, status, created_at, expires_at, service_name, country_code) VALUES (?, 'product', ?, ?, ?, 'pending', ?, ?, ?, ?)", (cb.from_user.id, pid, fname, fp, timestamp(), (now_utc()+timedelta(seconds=CANCEL_SECONDS)).isoformat(), p["name"], p["country_code"]))
         oid = cur.lastrowid
         await add_transaction(db, cb.from_user.id, -fp, "order", f"Sipariş #{oid}")
         await award_xp(cb.bot, db, cb.from_user.id, 20)
@@ -1658,7 +1657,10 @@ async def buy_prod(cb: CallbackQuery):
         asyncio.create_task(animate_order_status(cb.bot, cb.from_user.id, msg.message_id, oid))
     except: pass
     await notify_admins(cb.bot, f"🔔 **Sipariş #{oid}**\n👤 {await get_display_name(cb.from_user.id)}\n📦 {fname}\n💵 {format_money(fp)}",
-        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📱 Numara", callback_data=f"n:{oid}")],[InlineKeyboardButton(text="❌ İade", callback_data=f"o:refund:{oid}")]]))
+        kb=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Numara", callback_data=f"n:{oid}", style="primary")],
+            [InlineKeyboardButton(text="❌ İade", callback_data=f"o:refund:{oid}", style="danger")]
+        ]))
     await cb.answer("Sipariş verildi!")
 
 @router.callback_query(F.data.startswith("cart:add:"))
@@ -1689,7 +1691,8 @@ async def menu_cart(cb: CallbackQuery):
         u = await cur.fetchone()
     if not items:
         return await safe_edit(cb, "🛒 **Sepet boş.**", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🛍️ Market", callback_data="menu:catalog")],[InlineKeyboardButton(text="🔙", callback_data="menu:back")]
+            [InlineKeyboardButton(text="🛍️ Market", callback_data="menu:catalog", style="primary")],
+            [InlineKeyboardButton(text="🔙", callback_data="menu:back", style="danger")]
         ]))
     is_v = is_vip_user(u)
     total = 0; text = "🛒 **Sepetim**\n\n"; kb = []
@@ -1697,13 +1700,13 @@ async def menu_cart(cb: CallbackQuery):
         p = int(it["price_cents"] * 0.8) if is_v else it["price_cents"]
         total += p
         text += f"• {it['sn']} ({it['country_code']}) — `{format_money(p)}`\n"
-        kb.append([InlineKeyboardButton(text=f"❌ {it['sn'][:15]}", callback_data=f"cart:rm:{it['product_id']}")])
+        kb.append([InlineKeyboardButton(text=f"❌ {it['sn'][:15]}", callback_data=f"cart:rm:{it['product_id']}", style="danger")])
     text += f"\n💰 **Toplam:** `{format_money(total)}`\n"
     if u["balance_cents"] < total: text += f"⚠️ Yetersiz!"
     else:
         text += f"✅ Yeterli"
-        kb.insert(0, [InlineKeyboardButton(text=f"💳 Öde ({format_money(total)})", callback_data="cart:checkout")])
-    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:back")])
+        kb.insert(0, [InlineKeyboardButton(text=f"💳 Öde ({format_money(total)})", callback_data="cart:checkout", style="success")])
+    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:back", style="danger")])
     await safe_edit(cb, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown"); await cb.answer()
 
 @router.callback_query(F.data == "cart:checkout")
@@ -1713,8 +1716,7 @@ async def cart_checkout(cb: CallbackQuery):
         items = await cur.fetchall()
         if not items: return await cb.answer("Sepet boş.", show_alert=True)
         for it in items:
-            if not it["pactive"] or not it["sactive"]:
-                return await cb.answer(f"⚠️ '{it['sn']}' artık satışta değil.", show_alert=True)
+            if not it["pactive"] or not it["sactive"]: return await cb.answer(f"⚠️ '{it['sn']}' artık satışta değil.", show_alert=True)
         cur = await db.execute("SELECT balance_cents, vip_until FROM users WHERE user_id = ?", (cb.from_user.id,))
         u = await cur.fetchone()
         is_v = is_vip_user(u)
@@ -1725,8 +1727,7 @@ async def cart_checkout(cb: CallbackQuery):
         for it in items:
             p = int(it["price_cents"] * 0.8) if is_v else it["price_cents"]
             fname = f"{it['sn']} ({it['country_code']})"
-            cur = await db.execute("INSERT INTO orders (user_id, item_type, item_id, item_name, amount_cents, status, created_at, expires_at, service_name, country_code) VALUES (?, 'product', ?, ?, ?, 'pending', ?, ?, ?, ?)",
-                                 (cb.from_user.id, it["product_id"], fname, p, timestamp(), (now_utc()+timedelta(seconds=CANCEL_SECONDS)).isoformat(), it["sn"], it["country_code"]))
+            cur = await db.execute("INSERT INTO orders (user_id, item_type, item_id, item_name, amount_cents, status, created_at, expires_at, service_name, country_code) VALUES (?, 'product', ?, ?, ?, 'pending', ?, ?, ?, ?)", (cb.from_user.id, it["product_id"], fname, p, timestamp(), (now_utc()+timedelta(seconds=CANCEL_SECONDS)).isoformat(), it["sn"], it["country_code"]))
             oids.append(cur.lastrowid)
         await db.execute("DELETE FROM cart WHERE user_id = ?", (cb.from_user.id,))
         await add_transaction(db, cb.from_user.id, -total, "order", f"Sepet ({len(items)})")
@@ -1777,8 +1778,8 @@ async def admin_dash(cb: CallbackQuery):
             f"📦 Siparişler\n├ Tamamlanan: `{oc}`\n├ Bekleyen: `{op}`\n└ Ciro: `{format_money(rev)}`\n\n"
             f"🎁 Promo: `{pr}` • 💰 Hazine: `{hz}`")
     await safe_edit(cb, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Yenile", callback_data="admin:dashboard")],
-        [InlineKeyboardButton(text="🔙 Admin", callback_data="menu:admin")]
+        [InlineKeyboardButton(text="🔄 Yenile", callback_data="admin:dashboard", style="primary")],
+        [InlineKeyboardButton(text="🔙 Admin", callback_data="menu:admin", style="danger")]
     ]), parse_mode="Markdown"); await cb.answer()
 
 @router.callback_query(F.data == "admin:promos_list")
@@ -1788,15 +1789,20 @@ async def admin_promos_list(cb: CallbackQuery):
         cur = await db.execute("SELECT * FROM promos ORDER BY active DESC, code")
         ps = await cur.fetchall()
     if not ps: return await safe_edit(cb, "📋 Promo yok.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎁 Promo Ekle", callback_data="admin:promo_add")],[InlineKeyboardButton(text="🔙", callback_data="menu:admin")]
+        [InlineKeyboardButton(text="🎁 Promo Ekle", callback_data="admin:promo_add", style="success")],
+        [InlineKeyboardButton(text="🔙", callback_data="menu:admin", style="danger")]
     ]))
     text = "📋 **Promolar**\n\n"; kb = []
     for p in ps:
         st = "✅" if p["active"] else "❌"
         left = time_remaining_str(p["expires_at"]) if p["active"] else "-"
         text += f"{st} `{esc(p['code'])}`\n   💰 {format_money(p['bonus_cents'])} • 👥 {p['current_uses']}/{p['max_uses']} • ⏳ {left}\n\n"
-        if p["active"]: kb.append([InlineKeyboardButton(text=f"❌ İptal: {p['code']}", callback_data=f"admin:promo_cancel:{p['code']}")])
-    kb.append([InlineKeyboardButton(text="🔄", callback_data="admin:promos_list"), InlineKeyboardButton(text="🔙", callback_data="menu:admin")])
+        if p["active"]:
+            kb.append([InlineKeyboardButton(text=f"❌ İptal: {p['code']}", callback_data=f"admin:promo_cancel:{p['code']}", style="danger")])
+    kb.append([
+        InlineKeyboardButton(text="🔄", callback_data="admin:promos_list", style="primary"),
+        InlineKeyboardButton(text="🔙", callback_data="menu:admin", style="danger")
+    ])
     await safe_edit(cb, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML"); await cb.answer()
 
 @router.callback_query(F.data.startswith("admin:promo_cancel:"))
@@ -1817,15 +1823,20 @@ async def admin_hazines_list(cb: CallbackQuery):
         cur = await db.execute("SELECT * FROM hazine ORDER BY active DESC, id DESC")
         hs = await cur.fetchall()
     if not hs: return await safe_edit(cb, "📋 Hazine yok.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Hazine Ekle", callback_data="admin:hazine_add")],[InlineKeyboardButton(text="🔙", callback_data="menu:admin")]
+        [InlineKeyboardButton(text="💰 Hazine Ekle", callback_data="admin:hazine_add", style="success")],
+        [InlineKeyboardButton(text="🔙", callback_data="menu:admin", style="danger")]
     ]))
     text = "📋 **Hazineler**\n\n"; kb = []
     for h in hs:
         st = "✅" if h["active"] else "❌"
         left = time_remaining_str(h["expires_at"]) if h["active"] else "-"
         text += f"{st} `#{h['id']}`\n   💵 {format_money(h['remaining_cents'])}/{format_money(h['total_cents'])} • 👥 {h['current_users']}/{h['max_users']} • ⏳ {left}\n\n"
-        if h["active"]: kb.append([InlineKeyboardButton(text=f"❌ İptal #{h['id']}", callback_data=f"admin:hazine_cancel:{h['id']}")])
-    kb.append([InlineKeyboardButton(text="🔄", callback_data="admin:hazines_list"), InlineKeyboardButton(text="🔙", callback_data="menu:admin")])
+        if h["active"]:
+            kb.append([InlineKeyboardButton(text=f"❌ İptal #{h['id']}", callback_data=f"admin:hazine_cancel:{h['id']}", style="danger")])
+    kb.append([
+        InlineKeyboardButton(text="🔄", callback_data="admin:hazines_list", style="primary"),
+        InlineKeyboardButton(text="🔙", callback_data="menu:admin", style="danger")
+    ])
     await safe_edit(cb, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML"); await cb.answer()
 
 @router.callback_query(F.data.startswith("admin:hazine_cancel:"))
@@ -1852,8 +1863,12 @@ async def admin_specials_list(cb: CallbackQuery):
         st = "✅" if s["active"] else "❌"
         left = time_remaining_str(s["expires_at"]) if s["active"] else "-"
         text += f"{st} **{esc(s['name'])}**\n   💰 {format_money(s['price_cents'])} • 👥 {s['current_users']}/{s['max_users']} • ⏳ {left}\n\n"
-        if s["active"]: kb.append([InlineKeyboardButton(text=f"❌ İptal: {s['name'][:20]}", callback_data=f"admin:special_cancel:{s['id']}")])
-    kb.append([InlineKeyboardButton(text="🔄", callback_data="admin:specials_list"), InlineKeyboardButton(text="🔙", callback_data="menu:admin")])
+        if s["active"]:
+            kb.append([InlineKeyboardButton(text=f"❌ İptal: {s['name'][:20]}", callback_data=f"admin:special_cancel:{s['id']}", style="danger")])
+    kb.append([
+        InlineKeyboardButton(text="🔄", callback_data="admin:specials_list", style="primary"),
+        InlineKeyboardButton(text="🔙", callback_data="menu:admin", style="danger")
+    ])
     await safe_edit(cb, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML"); await cb.answer()
 
 @router.callback_query(F.data.startswith("admin:special_cancel:"))
@@ -1928,8 +1943,7 @@ async def admin_bal_amount(message: Message, state: FSMContext):
             await db.execute("UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?", (amt, tid))
         else:
             cur = await db.execute("UPDATE users SET balance_cents = balance_cents - ? WHERE user_id = ? AND balance_cents >= ?", (amt, tid, amt))
-            if cur.rowcount == 0:
-                return await message.answer("❌ Kullanıcının yeterli bakiyesi yok.")
+            if cur.rowcount == 0: return await message.answer("❌ Kullanıcının yeterli bakiyesi yok.")
         await add_transaction(db, tid, amt if is_add else -amt, "admin", f"Admin {'+' if is_add else '-'}")
         await db.commit()
     await message.answer(f"✅ **{data['target_name']}** bakiyesi {format_money(amt)} {'artırıldı' if is_add else 'azaltıldı'}.", reply_markup=back_to_menu_kb())
@@ -2023,8 +2037,8 @@ async def admin_product_start(cb: CallbackQuery, state: FSMContext):
         services = await cur.fetchall()
     if not services: return await safe_edit(cb, "⚠️ Önce hizmet ekle.", reply_markup=admin_panel_kb())
     await state.clear(); await state.set_state(AdminProductFlow.service_id)
-    kb = [[InlineKeyboardButton(text=s["name"], callback_data=f"sel_srv:{s['service_id']}")] for s in services]
-    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:admin")])
+    kb = [[InlineKeyboardButton(text=s["name"], callback_data=f"sel_srv:{s['service_id']}", style="primary")] for s in services]
+    kb.append([InlineKeyboardButton(text="🔙", callback_data="menu:admin", style="danger")])
     await safe_edit(cb, "🛒 **Ürün Ekle**\n\nHizmet:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown"); await cb.answer()
 
 @router.callback_query(AdminProductFlow.service_id, F.data.startswith("sel_srv:"))
@@ -2095,7 +2109,9 @@ async def admin_special_duration(message: Message, state: FSMContext, bot: Bot):
         username = await get_bot_username(bot)
         text = (f"✨ <b>ÖZEL HİZMET!</b>\n\n📦 <b>{esc(data['name'])}</b>\n💰 {format_money(data['price'])}\n"
                 f"👥 {data['max_users']} kişi • ⏳ {val} dk\n\n⚡ Hemen kap!")
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛒 Satın Al", url=f"https://t.me/{username}?start=special_{spid}")]]) if username else None
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Satın Al", url=f"https://t.me/{username}?start=special_{spid}", style="success")]
+        ]) if username else None
         try:
             msg = await bot.send_message(PROMO_CHANNEL_ID, text, reply_markup=kb, parse_mode="HTML")
             async with db_session() as db:
@@ -2158,7 +2174,9 @@ async def admin_promo_duration(message: Message, state: FSMContext):
         promo_like = {"code": code, "bonus_cents": bonus, "max_uses": max_uses, "current_uses": 0, "expires_at": expires_at}
         text, _, _ = build_promo_text(promo_like)
         username = await get_bot_username(message.bot)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎁 Kodu Kullan", url=f"https://t.me/{username}?start=promo_{code}")]]) if username else None
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 Kodu Kullan", url=f"https://t.me/{username}?start=promo_{code}", style="success")]
+        ]) if username else None
         try:
             sent = await message.bot.send_message(PROMO_CHANNEL_ID, text, reply_markup=kb, parse_mode="HTML")
             async with db_session() as db:
@@ -2208,7 +2226,9 @@ async def admin_hazine_duration(message: Message, state: FSMContext):
         hz_like = {"total_cents": data["total_amount"], "remaining_cents": data["total_amount"], "max_users": data["user_limit"], "current_users": 0, "expires_at": expires_at}
         text, _, _ = build_hazine_text(hz_like)
         username = await get_bot_username(message.bot)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💰 Kap", url=f"https://t.me/{username}?start=hazine_{hid}")]]) if username else None
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💰 Kap", url=f"https://t.me/{username}?start=hazine_{hid}", style="success")]
+        ]) if username else None
         try:
             sent = await message.bot.send_message(PROMO_CHANNEL_ID, text, reply_markup=kb, parse_mode="HTML")
             async with db_session() as db:
@@ -2259,7 +2279,9 @@ async def receive_phone(message: Message, state: FSMContext):
         try:
             await message.bot.edit_message_text(ORDER_MESSAGE_REFS[oid][0], ORDER_MESSAGE_REFS[oid][1], generate_circle(f"Numara:\n{full_phone}"), parse_mode="HTML")
         except: pass
-    await message.answer("Numara kaydedildi. Şimdi Kod Gir:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔑 Kod Gir", callback_data=f"c:{oid}")]]))
+    await message.answer("Numara kaydedildi. Şimdi Kod Gir:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔑 Kod Gir", callback_data=f"c:{oid}", style="primary")]
+    ]))
 
 @router.callback_query(F.data.startswith("c:"))
 async def enter_code(cb: CallbackQuery, state: FSMContext):
@@ -2369,20 +2391,16 @@ async def main():
     except Exception as e:
         logger.error(f"get_me: {e}")
 
-    # ▼ FIX: Eski webhook varsa temizle (yoksa hata vermez) ▼
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook cleared.")
     except Exception as e:
         logger.warning(f"delete_webhook: {e}")
-    # ▲ FIX ▲
 
     asyncio.create_task(channel_updater(bot))
     asyncio.create_task(background_cleanup(bot))
     print("Bot calisiyor...")
-    # ▼ FIX: drop_pending_updates ile eski update'leri temizle ▼
     await dp.start_polling(bot, drop_pending_updates=True)
-    # ▲ FIX ▲
 
 if __name__ == "__main__":
     asyncio.run(main())
