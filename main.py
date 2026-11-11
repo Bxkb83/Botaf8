@@ -392,134 +392,6 @@ def main_keyboard(uid):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def back_to_menu_kb():
-    retu0, expires_at TEXT, active INTEGER DEFAULT 1, msg_id INTEGER);
-            CREATE TABLE IF NOT EXISTS orders (order_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, item_type TEXT, item_id INTEGER, item_name TEXT, amount_cents INTEGER, status TEXT DEFAULT 'pending', created_at TEXT, expires_at TEXT, completed_at TEXT, phone TEXT, code TEXT, service_name TEXT, country_code TEXT);
-            CREATE TABLE IF NOT EXISTS transactions (transaction_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount_cents INTEGER, kind TEXT, note TEXT, created_at TEXT);
-            CREATE TABLE IF NOT EXISTS referrals (referral_id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, referred_user_id INTEGER UNIQUE, reward_cents INTEGER, rewarded_at TEXT, created_at TEXT);
-            CREATE TABLE IF NOT EXISTS star_payment_intents (payload TEXT PRIMARY KEY, user_id INTEGER, stars_amount INTEGER, credit_cents INTEGER, status TEXT DEFAULT 'pending', created_at TEXT);
-            CREATE TABLE IF NOT EXISTS support_tickets (ticket_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, body TEXT, status TEXT DEFAULT 'open', created_at TEXT);
-            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-            CREATE TABLE IF NOT EXISTS promos (code TEXT PRIMARY KEY, bonus_cents INTEGER, max_uses INTEGER, current_uses INTEGER DEFAULT 0, expires_at TEXT, active INTEGER DEFAULT 1, message_id INTEGER);
-            CREATE TABLE IF NOT EXISTS promo_uses (code TEXT, user_id INTEGER, PRIMARY KEY(code, user_id));
-            CREATE TABLE IF NOT EXISTS hazine (id INTEGER PRIMARY KEY AUTOINCREMENT, total_cents INTEGER, remaining_cents INTEGER, max_users INTEGER, current_users INTEGER DEFAULT 0, expires_at TEXT, active INTEGER DEFAULT 1, message_id INTEGER);
-            CREATE TABLE IF NOT EXISTS hazine_claims (hazine_id INTEGER, user_id INTEGER, amount_cents INTEGER, PRIMARY KEY(hazine_id, user_id));
-            CREATE TABLE IF NOT EXISTS bank_deposits (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount_cents INTEGER, interest_pct INTEGER, deposited_at TEXT, matures_at TEXT, withdrawn INTEGER DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS achievements (user_id INTEGER, achievement_id TEXT, unlocked_at TEXT, PRIMARY KEY(user_id, achievement_id));
-            CREATE TABLE IF NOT EXISTS quests_progress (user_id INTEGER, quest_id TEXT, date TEXT, progress INTEGER DEFAULT 0, completed INTEGER DEFAULT 0, claimed INTEGER DEFAULT 0, PRIMARY KEY(user_id, quest_id, date));
-            CREATE TABLE IF NOT EXISTS game_history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, game TEXT, bet_cents INTEGER, win_cents INTEGER, result TEXT, created_at TEXT);
-            CREATE TABLE IF NOT EXISTS favorites (user_id INTEGER, product_id INTEGER, PRIMARY KEY(user_id, product_id));
-            CREATE TABLE IF NOT EXISTS duels (id INTEGER PRIMARY KEY AUTOINCREMENT, challenger_id INTEGER, opponent_id INTEGER, bet_cents INTEGER, status TEXT DEFAULT 'pending', winner_id INTEGER, created_at TEXT);
-            CREATE TABLE IF NOT EXISTS cart (user_id INTEGER, product_id INTEGER, PRIMARY KEY(user_id, product_id));
-            INSERT OR IGNORE INTO settings (key, value) VALUES 
-                ('vip_enabled', '1'), ('vip_price_tl', '500'), ('vip_duration_days', '30'), ('ref_require_order', '1');
-        """)
-        await db.commit()
-    async with db_session() as db:
-        await _ensure_columns(db)
-
-async def get_setting(key, db=None):
-    if db:
-        cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        r = await cur.fetchone(); return r["value"] if r else None
-    async with db_session() as d:
-        cur = await d.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        r = await cur.fetchone(); return r["value"] if r else None
-
-async def is_feature_enabled(f): return (await get_setting(f)) == "1"
-
-async def ensure_user(user):
-    async with db_session() as db:
-        try:
-            await db.execute("INSERT OR IGNORE INTO users (user_id, created_at) VALUES (?, ?)", (user.id, timestamp()))
-            await db.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", (user.username or "", user.first_name or "User", user.id))
-            await db.commit()
-        except: pass
-
-async def add_transaction(db, uid, amt, kind, note):
-    await db.execute("INSERT INTO transactions (user_id, amount_cents, kind, note, created_at) VALUES (?, ?, ?, ?, ?)", (uid, amt, kind, note, timestamp()))
-
-async def get_display_name(uid):
-    async with db_session() as db:
-        cur = await db.execute("SELECT username, first_name FROM users WHERE user_id = ?", (uid,))
-        r = await cur.fetchone()
-    if r:
-        if r["username"]: return f"@{r['username']}"
-        return f"{r['first_name']} (ID: {uid})"
-    return f"ID: {uid}"
-
-async def notify_admins(bot, text, kb=None):
-    for aid in ADMIN_IDS:
-        try: await bot.send_message(aid, text, reply_markup=kb, parse_mode="Markdown")
-        except: pass
-
-async def safe_edit(cb, text, kb=None, parse_mode=None):
-    try:
-        await cb.message.edit_text(text, reply_markup=kb, parse_mode=parse_mode)
-    except TelegramAPIError:
-        try:
-            await cb.message.answer(text, reply_markup=kb, parse_mode=parse_mode)
-        except: pass
-
-async def unlock_achievement(bot, uid, aid):
-    if not uid: return False
-    async with db_session() as db:
-        cur = await db.execute("SELECT 1 FROM achievements WHERE user_id = ? AND achievement_id = ?", (uid, aid))
-        if await cur.fetchone(): return False
-        await db.execute("INSERT INTO achievements (user_id, achievement_id, unlocked_at) VALUES (?, ?, ?)", (uid, aid, timestamp()))
-        await db.commit()
-    a = next((x for x in ACHIEVEMENTS if x[0] == aid), None)
-    if a:
-        try: await bot.send_message(uid, f"🏆 **Başarım!**\n\n{a[1]}\n_{a[2]}_", parse_mode="Markdown")
-        except: pass
-    return True
-
-async def progress_quest(bot, uid, qtype, amount=1):
-    qdate = today_str()
-    async with db_session() as db:
-        for qid, qlabel, qreward, qtype_ in QUESTS:
-            if qtype_ != qtype: continue
-            target = {"play_1_game": 1, "order_1": 1, "spend_100": 10000, "invite_1": 1}[qid]
-            cur = await db.execute("SELECT progress, completed FROM quests_progress WHERE user_id = ? AND quest_id = ? AND date = ?", (uid, qid, qdate))
-            r = await cur.fetchone()
-            if r:
-                if r["completed"]: continue
-                np = r["progress"] + amount
-                comp = 1 if np >= target else 0
-                await db.execute("UPDATE quests_progress SET progress = ?, completed = ? WHERE user_id = ? AND quest_id = ? AND date = ?", (np, comp, uid, qid, qdate))
-            else:
-                comp = 1 if amount >= target else 0
-                await db.execute("INSERT INTO quests_progress (user_id, quest_id, date, progress, completed) VALUES (?, ?, ?, ?, ?)", (uid, qid, qdate, amount, comp))
-        await db.commit()
-
-async def award_xp(bot, db, uid, xp_amount):
-    leveled, lv = await add_xp(db, uid, xp_amount)
-    if leveled > 0:
-        await db.commit()
-        try: await bot.send_message(uid, f"⬆️ **Seviye Atladın!** Yeni: **{lv}**", parse_mode="Markdown")
-        except: pass
-        if lv >= 5: await unlock_achievement(bot, uid, "level_5")
-        if lv >= 10: await unlock_achievement(bot, uid, "level_10")
-
-# ================= KEYBOARDS =================
-def main_keyboard(uid):
-    rows = [
-        [InlineKeyboardButton(text="🛍️ Market", callback_data="menu:catalog"), InlineKeyboardButton(text="💰 Bakiyem", callback_data="menu:balance")],
-        [InlineKeyboardButton(text="📦 Siparişlerim", callback_data="menu:orders"), InlineKeyboardButton(text="🎯 Günlük", callback_data="menu:daily")],
-        [InlineKeyboardButton(text="🎮 Oyunlar", callback_data="menu:games"), InlineKeyboardButton(text="🏆 Liderlik", callback_data="menu:leaderboard")],
-        [InlineKeyboardButton(text="👤 Profilim", callback_data="menu:profile"), InlineKeyboardButton(text="📊 İstatistikler", callback_data="menu:stats")],
-        [InlineKeyboardButton(text="⭐ Yıldız Yükle", callback_data="menu:topup"), InlineKeyboardButton(text="💎 VIP", callback_data="menu:vip")],
-        [InlineKeyboardButton(text="🎯 Görevler", callback_data="menu:quests"), InlineKeyboardButton(text="🏆 Başarımlar", callback_data="menu:achievements")],
-        [InlineKeyboardButton(text="💼 Banka", callback_data="menu:bank"), InlineKeyboardButton(text="🤝 Transfer", callback_data="menu:transfer")],
-        [InlineKeyboardButton(text="👥 Davet", callback_data="menu:referral"), InlineKeyboardButton(text="🎁 Fırsatlar", callback_data="menu:active")],
-        [InlineKeyboardButton(text="🎫 Kod Takip", callback_data="menu:track"), InlineKeyboardButton(text="📞 Kod Geçmişi", callback_data="menu:code_history")],
-        [InlineKeyboardButton(text="🛒 Sepetim", callback_data="menu:cart"), InlineKeyboardButton(text="⭐ Favoriler", callback_data="menu:favorites")],
-        [InlineKeyboardButton(text="📜 İşlem Geçmişi", callback_data="menu:history"), InlineKeyboardButton(text="💬 Destek", callback_data="menu:support")],
-        [InlineKeyboardButton(text="ℹ️ Yardım", callback_data="menu:help")]
-    ]
-    if is_admin(uid): rows.append([InlineKeyboardButton(text="🛠️ Admin Paneli", callback_data="menu:admin")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def back_to_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu:back")]])
 
 def topup_keyboard():
@@ -727,48 +599,99 @@ async def build_welcome(uid, fname):
             f"🚀 *7/24 otomatik teslimat.*\n\n"
             f"👇 Menüden işlem seç:")
 
+# ▼ FIX: start_handler güvenli sürüm — ReplyKeyboardRemove(), Markdown fallback, sessiz hata yutma yok ▼
 @router.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
-    if not message.from_user: return
+    if not message.from_user:
+        return
     uid = message.from_user.id
-    await state.clear()
-    try: await message.answer("🔄 Hazırlanıyor...", reply_markup=ReplyKeyboardRemove())
-    except: pass
-    async with db_session() as db:
-        cur = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (uid,))
-        is_new = await cur.fetchone() is None
-    if is_new: await ensure_user(message.from_user)
-    args = message.text.split()
-    if len(args) > 1:
-        param = args[1]
-        if param.startswith("ref_"):
-            try:
-                rid = int(param[4:])
-                if rid != uid and is_new:
-                    async with db_session() as db:
-                        cur = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (rid,))
-                        if await cur.fetchone():
-                            await db.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_user_id, reward_cents, created_at) VALUES (?, ?, ?, ?)", (rid, uid, REFERRAL_BONUS_CENTS, timestamp()))
-                            await db.commit()
-                            await progress_quest(message.bot, rid, "referral", 1)
-                    if (await get_setting("ref_require_order")) == "0":
+
+    try:
+        await state.clear()
+    except Exception as e:
+        logger.error(f"start state_clear: {e}")
+
+    try:
+        await message.answer("🔄 Hazırlanıyor...", reply_markup=ReplyKeyboardRemove())
+    except Exception as e:
+        logger.error(f"start reply_kb_remove: {e}")
+
+    is_new = False
+    try:
+        async with db_session() as db:
+            cur = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (uid,))
+            is_new = (await cur.fetchone()) is None
+    except Exception as e:
+        logger.error(f"start db_check: {e}")
+
+    if is_new:
+        try:
+            await ensure_user(message.from_user)
+        except Exception as e:
+            logger.error(f"start ensure_user: {e}")
+
+    try:
+        args = (message.text or "").split()
+        if len(args) > 1:
+            param = args[1]
+            if param.startswith("ref_"):
+                try:
+                    rid = int(param[4:])
+                    if rid != uid and is_new:
                         async with db_session() as db:
-                            cur = await db.execute("SELECT 1 FROM referrals WHERE referred_user_id = ? AND rewarded_at IS NULL", (uid,))
+                            cur = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (rid,))
                             if await cur.fetchone():
-                                await db.execute("UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?", (REFERRAL_BONUS_CENTS, rid))
-                                await db.execute("UPDATE referrals SET rewarded_at = ? WHERE referred_user_id = ?", (timestamp(), uid))
-                                await add_transaction(db, rid, REFERRAL_BONUS_CENTS, "referral", "Davet ödülü")
+                                await db.execute(
+                                    "INSERT OR IGNORE INTO referrals (referrer_id, referred_user_id, reward_cents, created_at) VALUES (?, ?, ?, ?)",
+                                    (rid, uid, REFERRAL_BONUS_CENTS, timestamp()),
+                                )
                                 await db.commit()
-            except: pass
-        elif param.startswith("promo_"): await process_promo_claim(message, param[6:].upper())
-        elif param.startswith("hazine_"):
-            try: await process_hazine_claim(message, int(param[7:]))
-            except: pass
-        elif param.startswith("special_"):
-            try: await process_special_claim(message, int(param[8:]), message.from_user)
-            except: pass
-    text = await build_welcome(uid, message.from_user.first_name)
-    await message.answer(text, reply_markup=main_keyboard(uid), parse_mode="Markdown")
+                                await progress_quest(message.bot, rid, "referral", 1)
+                        if (await get_setting("ref_require_order")) == "0":
+                            async with db_session() as db:
+                                cur = await db.execute("SELECT 1 FROM referrals WHERE referred_user_id = ? AND rewarded_at IS NULL", (uid,))
+                                if await cur.fetchone():
+                                    await db.execute("UPDATE users SET balance_cents = balance_cents + ? WHERE user_id = ?", (REFERRAL_BONUS_CENTS, rid))
+                                    await db.execute("UPDATE referrals SET rewarded_at = ? WHERE referred_user_id = ?", (timestamp(), uid))
+                                    await add_transaction(db, rid, REFERRAL_BONUS_CENTS, "referral", "Davet ödülü")
+                                    await db.commit()
+                except Exception as e:
+                    logger.error(f"start ref_parse: {e}")
+            elif param.startswith("promo_"):
+                await process_promo_claim(message, param[6:].upper())
+            elif param.startswith("hazine_"):
+                try:
+                    await process_hazine_claim(message, int(param[7:]))
+                except Exception as e:
+                    logger.error(f"start hazine_claim: {e}")
+            elif param.startswith("special_"):
+                try:
+                    await process_special_claim(message, int(param[8:]), message.from_user)
+                except Exception as e:
+                    logger.error(f"start special_claim: {e}")
+    except Exception as e:
+        logger.error(f"start_params: {e}")
+
+    try:
+        text = await build_welcome(uid, message.from_user.first_name)
+        await message.answer(text, reply_markup=main_keyboard(uid), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"start_final_markdown: {e}")
+        try:
+            fname = message.from_user.first_name or "User"
+            await message.answer(
+                f"🌟 Hoş geldin, {fname}!\n\nMenüyü kullanmak için aşağıdaki butonlara tıklayabilirsin.",
+                reply_markup=main_keyboard(uid),
+            )
+        except Exception as e2:
+            logger.error(f"start_final_plain: {e2}")
+# ▲ FIX ▲
+
+# ▼ FIX: /ping test komutu — teşhis için ▼
+@router.message(Command("ping"))
+async def cmd_ping(message: Message):
+    await message.answer("🏓 Pong! Bot mesaj alıyor ve cevap veriyor.")
+# ▲ FIX ▲
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
@@ -2431,7 +2354,6 @@ async def fallback_callback(cb: CallbackQuery):
 
 # ================= MAIN =================
 async def main():
-    logging.basicConfig(level=logging.INFO)
     if not BOT_TOKEN:
         print("HATA: BOT_TOKEN eksik!"); return
     bot = Bot(token=BOT_TOKEN)
@@ -2439,14 +2361,28 @@ async def main():
     dp.include_router(router)
     dp.include_router(fallback_router)
     await init_db()
+
     try:
         me = await bot.get_me()
         _bot_username_cache["value"] = me.username or ""
-    except: pass
+        logger.info(f"Bot started: @{me.username} (id={me.id})")
+    except Exception as e:
+        logger.error(f"get_me: {e}")
+
+    # ▼ FIX: Eski webhook varsa temizle (yoksa hata vermez) ▼
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook cleared.")
+    except Exception as e:
+        logger.warning(f"delete_webhook: {e}")
+    # ▲ FIX ▲
+
     asyncio.create_task(channel_updater(bot))
     asyncio.create_task(background_cleanup(bot))
     print("Bot calisiyor...")
-    await dp.start_polling(bot)
+    # ▼ FIX: drop_pending_updates ile eski update'leri temizle ▼
+    await dp.start_polling(bot, drop_pending_updates=True)
+    # ▲ FIX ▲
 
 if __name__ == "__main__":
     asyncio.run(main())
