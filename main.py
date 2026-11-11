@@ -5,6 +5,7 @@ import html
 import logging
 import os
 import random
+import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import uuid4
@@ -19,6 +20,15 @@ from aiogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice,
     Message, PreCheckoutQuery, ReplyKeyboardRemove, BufferedInputFile
 )
+
+# ▼ FIX: Logging stdout'a → Railway severity:info olarak görür ▼
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    force=True,
+)
+# ▲ FIX ▲
 
 # ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -200,6 +210,10 @@ async def open_db():
     db = await aiosqlite.connect(DB_PATH, timeout=10)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA foreign_keys = ON")
+    # ▼ FIX: WAL + busy_timeout → eşzamanlı erişimde kilitlenme önler ▼
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA busy_timeout=5000")
+    # ▲ FIX ▲
     return db
 
 @asynccontextmanager
@@ -250,6 +264,135 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS services (service_id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, active INTEGER DEFAULT 1);
             CREATE TABLE IF NOT EXISTS products (product_id INTEGER PRIMARY KEY AUTOINCREMENT, service_id INTEGER, country_code TEXT, price_cents INTEGER, active INTEGER DEFAULT 1);
             CREATE TABLE IF NOT EXISTS special_services (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, price_cents INTEGER, max_users INTEGER, current_users INTEGER DEFAULT 0, expires_at TEXT, active INTEGER DEFAULT 1, msg_id INTEGER);
+            CREATE TABLE IF NOT EXISTS orders (order_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, item_type TEXT, item_id INTEGER, item_name TEXT, amount_cents INTEGER, status TEXT DEFAULT 'pending', created_at TEXT, expires_at TEXT, completed_at TEXT, phone TEXT, code TEXT, service_name TEXT, country_code TEXT);
+            CREATE TABLE IF NOT EXISTS transactions (transaction_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount_cents INTEGER, kind TEXT, note TEXT, created_at TEXT);
+            CREATE TABLE IF NOT EXISTS referrals (referral_id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, referred_user_id INTEGER UNIQUE, reward_cents INTEGER, rewarded_at TEXT, created_at TEXT);
+            CREATE TABLE IF NOT EXISTS star_payment_intents (payload TEXT PRIMARY KEY, user_id INTEGER, stars_amount INTEGER, credit_cents INTEGER, status TEXT DEFAULT 'pending', created_at TEXT);
+            CREATE TABLE IF NOT EXISTS support_tickets (ticket_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, body TEXT, status TEXT DEFAULT 'open', created_at TEXT);
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS promos (code TEXT PRIMARY KEY, bonus_cents INTEGER, max_uses INTEGER, current_uses INTEGER DEFAULT 0, expires_at TEXT, active INTEGER DEFAULT 1, message_id INTEGER);
+            CREATE TABLE IF NOT EXISTS promo_uses (code TEXT, user_id INTEGER, PRIMARY KEY(code, user_id));
+            CREATE TABLE IF NOT EXISTS hazine (id INTEGER PRIMARY KEY AUTOINCREMENT, total_cents INTEGER, remaining_cents INTEGER, max_users INTEGER, current_users INTEGER DEFAULT 0, expires_at TEXT, active INTEGER DEFAULT 1, message_id INTEGER);
+            CREATE TABLE IF NOT EXISTS hazine_claims (hazine_id INTEGER, user_id INTEGER, amount_cents INTEGER, PRIMARY KEY(hazine_id, user_id));
+            CREATE TABLE IF NOT EXISTS bank_deposits (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount_cents INTEGER, interest_pct INTEGER, deposited_at TEXT, matures_at TEXT, withdrawn INTEGER DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS achievements (user_id INTEGER, achievement_id TEXT, unlocked_at TEXT, PRIMARY KEY(user_id, achievement_id));
+            CREATE TABLE IF NOT EXISTS quests_progress (user_id INTEGER, quest_id TEXT, date TEXT, progress INTEGER DEFAULT 0, completed INTEGER DEFAULT 0, claimed INTEGER DEFAULT 0, PRIMARY KEY(user_id, quest_id, date));
+            CREATE TABLE IF NOT EXISTS game_history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, game TEXT, bet_cents INTEGER, win_cents INTEGER, result TEXT, created_at TEXT);
+            CREATE TABLE IF NOT EXISTS favorites (user_id INTEGER, product_id INTEGER, PRIMARY KEY(user_id, product_id));
+            CREATE TABLE IF NOT EXISTS duels (id INTEGER PRIMARY KEY AUTOINCREMENT, challenger_id INTEGER, opponent_id INTEGER, bet_cents INTEGER, status TEXT DEFAULT 'pending', winner_id INTEGER, created_at TEXT);
+            CREATE TABLE IF NOT EXISTS cart (user_id INTEGER, product_id INTEGER, PRIMARY KEY(user_id, product_id));
+            INSERT OR IGNORE INTO settings (key, value) VALUES 
+                ('vip_enabled', '1'), ('vip_price_tl', '500'), ('vip_duration_days', '30'), ('ref_require_order', '1');
+        """)
+        await db.commit()
+    async with db_session() as db:
+        await _ensure_columns(db)
+
+async def get_setting(key, db=None):
+    if db:
+        cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        r = await cur.fetchone(); return r["value"] if r else None
+    async with db_session() as d:
+        cur = await d.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        r = await cur.fetchone(); return r["value"] if r else None
+
+async def is_feature_enabled(f): return (await get_setting(f)) == "1"
+
+async def ensure_user(user):
+    async with db_session() as db:
+        try:
+            await db.execute("INSERT OR IGNORE INTO users (user_id, created_at) VALUES (?, ?)", (user.id, timestamp()))
+            await db.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?", (user.username or "", user.first_name or "User", user.id))
+            await db.commit()
+        except Exception as e:
+            logger.error(f"ensure_user: {e}")
+
+async def add_transaction(db, uid, amt, kind, note):
+    await db.execute("INSERT INTO transactions (user_id, amount_cents, kind, note, created_at) VALUES (?, ?, ?, ?, ?)", (uid, amt, kind, note, timestamp()))
+
+async def get_display_name(uid):
+    async with db_session() as db:
+        cur = await db.execute("SELECT username, first_name FROM users WHERE user_id = ?", (uid,))
+        r = await cur.fetchone()
+    if r:
+        if r["username"]: return f"@{r['username']}"
+        return f"{r['first_name']} (ID: {uid})"
+    return f"ID: {uid}"
+
+async def notify_admins(bot, text, kb=None):
+    for aid in ADMIN_IDS:
+        try: await bot.send_message(aid, text, reply_markup=kb, parse_mode="Markdown")
+        except: pass
+
+async def safe_edit(cb, text, kb=None, parse_mode=None):
+    try:
+        await cb.message.edit_text(text, reply_markup=kb, parse_mode=parse_mode)
+    except TelegramAPIError:
+        try:
+            await cb.message.answer(text, reply_markup=kb, parse_mode=parse_mode)
+        except: pass
+
+async def unlock_achievement(bot, uid, aid):
+    if not uid: return False
+    async with db_session() as db:
+        cur = await db.execute("SELECT 1 FROM achievements WHERE user_id = ? AND achievement_id = ?", (uid, aid))
+        if await cur.fetchone(): return False
+        await db.execute("INSERT INTO achievements (user_id, achievement_id, unlocked_at) VALUES (?, ?, ?)", (uid, aid, timestamp()))
+        await db.commit()
+    a = next((x for x in ACHIEVEMENTS if x[0] == aid), None)
+    if a:
+        try: await bot.send_message(uid, f"🏆 **Başarım!**\n\n{a[1]}\n_{a[2]}_", parse_mode="Markdown")
+        except: pass
+    return True
+
+async def progress_quest(bot, uid, qtype, amount=1):
+    qdate = today_str()
+    async with db_session() as db:
+        for qid, qlabel, qreward, qtype_ in QUESTS:
+            if qtype_ != qtype: continue
+            target = {"play_1_game": 1, "order_1": 1, "spend_100": 10000, "invite_1": 1}[qid]
+            cur = await db.execute("SELECT progress, completed FROM quests_progress WHERE user_id = ? AND quest_id = ? AND date = ?", (uid, qid, qdate))
+            r = await cur.fetchone()
+            if r:
+                if r["completed"]: continue
+                np = r["progress"] + amount
+                comp = 1 if np >= target else 0
+                await db.execute("UPDATE quests_progress SET progress = ?, completed = ? WHERE user_id = ? AND quest_id = ? AND date = ?", (np, comp, uid, qid, qdate))
+            else:
+                comp = 1 if amount >= target else 0
+                await db.execute("INSERT INTO quests_progress (user_id, quest_id, date, progress, completed) VALUES (?, ?, ?, ?, ?)", (uid, qid, qdate, amount, comp))
+        await db.commit()
+
+async def award_xp(bot, db, uid, xp_amount):
+    leveled, lv = await add_xp(db, uid, xp_amount)
+    if leveled > 0:
+        await db.commit()
+        try: await bot.send_message(uid, f"⬆️ **Seviye Atladın!** Yeni: **{lv}**", parse_mode="Markdown")
+        except: pass
+        if lv >= 5: await unlock_achievement(bot, uid, "level_5")
+        if lv >= 10: await unlock_achievement(bot, uid, "level_10")
+
+# ================= KEYBOARDS =================
+def main_keyboard(uid):
+    rows = [
+        [InlineKeyboardButton(text="🛍️ Market", callback_data="menu:catalog"), InlineKeyboardButton(text="💰 Bakiyem", callback_data="menu:balance")],
+        [InlineKeyboardButton(text="📦 Siparişlerim", callback_data="menu:orders"), InlineKeyboardButton(text="🎯 Günlük", callback_data="menu:daily")],
+        [InlineKeyboardButton(text="🎮 Oyunlar", callback_data="menu:games"), InlineKeyboardButton(text="🏆 Liderlik", callback_data="menu:leaderboard")],
+        [InlineKeyboardButton(text="👤 Profilim", callback_data="menu:profile"), InlineKeyboardButton(text="📊 İstatistikler", callback_data="menu:stats")],
+        [InlineKeyboardButton(text="⭐ Yıldız Yükle", callback_data="menu:topup"), InlineKeyboardButton(text="💎 VIP", callback_data="menu:vip")],
+        [InlineKeyboardButton(text="🎯 Görevler", callback_data="menu:quests"), InlineKeyboardButton(text="🏆 Başarımlar", callback_data="menu:achievements")],
+        [InlineKeyboardButton(text="💼 Banka", callback_data="menu:bank"), InlineKeyboardButton(text="🤝 Transfer", callback_data="menu:transfer")],
+        [InlineKeyboardButton(text="👥 Davet", callback_data="menu:referral"), InlineKeyboardButton(text="🎁 Fırsatlar", callback_data="menu:active")],
+        [InlineKeyboardButton(text="🎫 Kod Takip", callback_data="menu:track"), InlineKeyboardButton(text="📞 Kod Geçmişi", callback_data="menu:code_history")],
+        [InlineKeyboardButton(text="🛒 Sepetim", callback_data="menu:cart"), InlineKeyboardButton(text="⭐ Favoriler", callback_data="menu:favorites")],
+        [InlineKeyboardButton(text="📜 İşlem Geçmişi", callback_data="menu:history"), InlineKeyboardButton(text="💬 Destek", callback_data="menu:support")],
+        [InlineKeyboardButton(text="ℹ️ Yardım", callback_data="menu:help")]
+    ]
+    if is_admin(uid): rows.append([InlineKeyboardButton(text="🛠️ Admin Paneli", callback_data="menu:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def back_to_menu_kb():
+    retu0, expires_at TEXT, active INTEGER DEFAULT 1, msg_id INTEGER);
             CREATE TABLE IF NOT EXISTS orders (order_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, item_type TEXT, item_id INTEGER, item_name TEXT, amount_cents INTEGER, status TEXT DEFAULT 'pending', created_at TEXT, expires_at TEXT, completed_at TEXT, phone TEXT, code TEXT, service_name TEXT, country_code TEXT);
             CREATE TABLE IF NOT EXISTS transactions (transaction_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount_cents INTEGER, kind TEXT, note TEXT, created_at TEXT);
             CREATE TABLE IF NOT EXISTS referrals (referral_id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER, referred_user_id INTEGER UNIQUE, reward_cents INTEGER, rewarded_at TEXT, created_at TEXT);
