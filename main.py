@@ -207,7 +207,7 @@ class PromoUseFlow(StatesGroup):
 
 # ================= DB =================
 async def open_db():
-    db = await aiosqlite.connect(DB_PATH, timeout=10)
+    db = await aiosqlite.connect(DB_PATH, timeout=20)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA foreign_keys = ON")
     await db.execute("PRAGMA journal_mode=WAL")
@@ -227,8 +227,8 @@ async def _ensure_columns(db):
         ("users", "total_won", "INTEGER DEFAULT 0"), ("users", "total_lost", "INTEGER DEFAULT 0"),
         ("users", "games_played", "INTEGER DEFAULT 0"), ("users", "games_won", "INTEGER DEFAULT 0"),
         ("users", "total_spent", "INTEGER DEFAULT 0"), ("users", "duels_won", "INTEGER DEFAULT 0"),
-        ("users", "spins_total", "INTEGER DEFAULT 0"), ("orders", "completed_at", "TEXT"),
-        ("orders", "phone", "TEXT"), ("orders", "code", "TEXT"),
+        ("users", "spins_total", "INTEGER DEFAULT 0"),
+        ("orders", "completed_at", "TEXT"), ("orders", "phone", "TEXT"), ("orders", "code", "TEXT"),
         ("orders", "service_name", "TEXT"), ("orders", "country_code", "TEXT"),
     ]
     for table, col, typedef in migrations:
@@ -706,7 +706,7 @@ async def cmd_ping(message: Message):
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("İptal edildi.", reply_markup=back_to_menu_kb())
+    await message.answer("İşlem iptal edildi.", reply_markup=back_to_menu_kb())
 
 @router.callback_query(F.data == "menu:back")
 async def back_to_menu(cb: CallbackQuery, state: FSMContext):
